@@ -67,6 +67,13 @@ async function route(req: Request, path: string, params: URLSearchParams, header
     return json({ added: upserted, totalJobs }, 200, headers);
   }
 
+  if (path === "/v1/notifications/run" && req.method === "POST") {
+    requireAdmin(req);
+    const body = await readJson(req);
+    const result = await runNotificationWorker(body);
+    return json({ result }, 200, headers);
+  }
+
   if (path === "/v1/jobs" && req.method === "GET") {
     const result = await queryJobs(params);
     return json(result, 200, headers);
@@ -427,6 +434,157 @@ async function markExpiredJobs(): Promise<void> {
     .neq("expires_at", "")
     .lt("expires_at", now);
   if (error) throw error;
+}
+
+async function runNotificationWorker(input: AnyRecord = {}): Promise<AnyRecord> {
+  const hours = clamp(Number(input.hours || 48), 1, 168);
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const recentJobs = await loadRecentJobs(since, clamp(Number(input.limit || 120), 1, 500));
+  if (!recentJobs.length) return { checkedJobs: 0, checkedUsers: 0, created: 0, emailed: 0 };
+
+  const [{ data: preferences, error: preferencesError }, { data: profiles, error: profilesError }, { data: settings, error: settingsError }, { data: cvs, error: cvsError }, { data: applications, error: applicationsError }] = await Promise.all([
+    db.from("notification_preferences").select("*").or("in_app_enabled.eq.true,email_job_alerts.eq.true"),
+    db.from("profiles").select("*"),
+    db.from("user_settings").select("*"),
+    db.from("cv_documents").select("*").eq("is_primary", true),
+    db.from("applications").select("user_id,job_id,status")
+  ]);
+  if (preferencesError) throw preferencesError;
+  if (profilesError) throw profilesError;
+  if (settingsError) throw settingsError;
+  if (cvsError) throw cvsError;
+  if (applicationsError) throw applicationsError;
+
+  const profileMap = new Map((profiles || []).map((row: AnyRecord) => [row.id, row]));
+  const settingsMap = new Map((settings || []).map((row: AnyRecord) => [row.user_id, row]));
+  const cvMap = new Map((cvs || []).map((row: AnyRecord) => [row.user_id, row]));
+  const applicationsByUser = groupBy(applications || [], "user_id");
+  let created = 0;
+  let emailed = 0;
+
+  for (const preference of preferences || []) {
+    const userId = preference.user_id;
+    const cv = cvMap.get(userId);
+    if (!cv?.cv_state) continue;
+    const threshold = clamp(Number(settingsMap.get(userId)?.minimum_match_score || 70), 0, 100);
+    const appliedJobIds = new Set((applicationsByUser.get(userId) || []).map((row: AnyRecord) => row.job_id));
+
+    for (const job of recentJobs) {
+      const match = scoreJob(cv.cv_state, job);
+      const similar = appliedJobIds.has(job.id) || isSimilarToApplied(job, recentJobs.filter((item) => appliedJobIds.has(item.id)));
+      const type = similar ? "new_job_similar_to_application" : "new_job_match";
+      if (match.score < threshold && !similar) continue;
+      if (preference.in_app_enabled === false && preference.email_job_alerts === false) continue;
+
+      const notification = {
+        user_id: userId,
+        type,
+        title: `${match.score}% fit`,
+        body: `${job.title}${job.company ? ` at ${job.company}` : ""}${job.locationText ? `, ${job.locationText}` : ""}.`,
+        action_url: `#jobs?job=${encodeURIComponent(job.id)}`,
+        payload: { jobId: job.id, score: match.score, bucket: match.bucket, matched: match.matched, missing: match.missing }
+      };
+      const { data, error } = await db
+        .from("notifications")
+        .upsert(notification, { onConflict: "user_id,type,action_url", ignoreDuplicates: true })
+        .select("*")
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) continue;
+      created += 1;
+      if (preference.email_job_alerts && preference.frequency === "immediate") {
+        const sent = await sendNotificationEmail(profileMap.get(userId), data);
+        if (sent) emailed += 1;
+      }
+    }
+  }
+
+  return { checkedJobs: recentJobs.length, checkedUsers: (preferences || []).length, created, emailed };
+}
+
+async function loadRecentJobs(since: string, limit: number): Promise<AnyRecord[]> {
+  const { data, error } = await db
+    .from("jobs")
+    .select("*")
+    .neq("status", "expired")
+    .gte("first_seen_at", since)
+    .order("first_seen_at", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return (data || []).map(mapJobRow);
+}
+
+function groupBy(rows: AnyRecord[], key: string): Map<string, AnyRecord[]> {
+  const map = new Map<string, AnyRecord[]>();
+  rows.forEach((row) => {
+    const value = clean(row[key]);
+    if (!value) return;
+    map.set(value, [...(map.get(value) || []), row]);
+  });
+  return map;
+}
+
+function isSimilarToApplied(job: AnyRecord, appliedJobs: AnyRecord[]): boolean {
+  const text = `${job.title} ${job.company} ${job.category} ${job.locationText}`.toLowerCase();
+  return appliedJobs.some((applied) => {
+    const terms = [applied.title, applied.company, applied.category, applied.locationText]
+      .map((item) => clean(item).toLowerCase())
+      .filter((item) => item.length > 3);
+    return terms.some((term) => text.includes(term));
+  });
+}
+
+async function sendNotificationEmail(profile: AnyRecord | undefined, notification: AnyRecord): Promise<boolean> {
+  const apiKey = Deno.env.get("RESEND_API_KEY") || "";
+  const from = Deno.env.get("NOTIFICATION_FROM_EMAIL") || "";
+  const to = clean(profile?.email);
+  if (!apiKey || !from || !to) {
+    await recordDelivery(notification.id, "email", "skipped", "", "Email provider is not configured.");
+    return false;
+  }
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        from,
+        to,
+        subject: notification.title || "SearchR alert",
+        html: `<p>${escapeHtmlText(notification.body)}</p><p><a href="https://searchr.co.za/${notification.action_url || ""}">Open SearchR</a></p>`
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+    await recordDelivery(notification.id, "email", "sent", clean(payload.id), "");
+    return true;
+  } catch (error) {
+    await recordDelivery(notification.id, "email", "failed", "", formatError(error));
+    return false;
+  }
+}
+
+async function recordDelivery(notificationId: string, channel: string, status: string, providerMessageId: string, errorText: string): Promise<void> {
+  const row = {
+    notification_id: notificationId,
+    channel,
+    status,
+    provider_message_id: providerMessageId,
+    error_text: errorText,
+    sent_at: status === "sent" ? new Date().toISOString() : null
+  };
+  const { error } = await db.from("notification_deliveries").insert(row);
+  if (error) console.error(error);
+}
+
+function escapeHtmlText(value: string): string {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 function mapJobRow(row: AnyRecord): AnyRecord {

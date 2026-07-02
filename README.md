@@ -8,8 +8,10 @@ The deployed Edge Function still lives at `supabase/functions/scriptory-api` for
 
 - `supabase/migrations/20260701000000_scriptory_backend.sql`
   Creates `jobs`, `ingestion_runs`, and `applications` in Postgres.
+- `supabase/migrations/20260702000000_accounts_profiles_notifications.sql`
+  Adds Supabase Auth-owned profiles, settings, CV documents, saved jobs, application kits, saved searches, notifications, delivery audit rows, and RLS policies.
 - `supabase/functions/scriptory-api/index.ts`
-  Serves the API as a Supabase Edge Function.
+  Serves the API as a Supabase Edge Function and runs notification matching.
 - `supabase/functions/_shared/domain.ts`
   Contains job normalization, matching, application kit building, and source adapters.
 
@@ -39,6 +41,8 @@ SUPABASE_SERVICE_ROLE_KEY=
 ADZUNA_APP_ID=
 ADZUNA_APP_KEY=
 ADMIN_TOKEN=
+RESEND_API_KEY=
+NOTIFICATION_FROM_EMAIL=
 ```
 
 Keep real keys out of `.env.example`.
@@ -101,11 +105,31 @@ All routes are under the function base URL.
 - `GET /v1/jobs/:id`
 - `POST /v1/matches`
 - `POST /v1/application-kits`
+- `POST /v1/notifications/run`
 - `GET /v1/applications`
 - `POST /v1/applications`
 - `POST /v1/admin/jobs`
 
 Admin endpoints use `Authorization: Bearer <ADMIN_TOKEN>` when `ADMIN_TOKEN` is set.
+
+`/v1/notifications/run` scores recently ingested jobs against primary user CVs, saved preferences, and application history. It writes in-app notifications and sends immediate email only when `RESEND_API_KEY`, `NOTIFICATION_FROM_EMAIL`, and the user's preferences allow it.
+
+## Accounts
+
+The web app uses Supabase Auth directly from the browser with the public anon key. User-owned tables are protected with Row Level Security:
+
+- `profiles`
+- `user_settings`
+- `notification_preferences`
+- `cv_documents`
+- `saved_jobs`
+- `application_kits`
+- `job_alert_rules`
+- `user_job_matches`
+- `notifications`
+- `account_events`
+
+The auth trigger creates a profile, settings row, notification preferences row, and welcome notification for each new user.
 
 ## Ingestion
 

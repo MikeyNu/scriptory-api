@@ -9,6 +9,7 @@ const requiredFiles = [
   "supabase/config.toml",
   "supabase/.env.example",
   "supabase/migrations/20260701000000_scriptory_backend.sql",
+  "supabase/migrations/20260702000000_accounts_profiles_notifications.sql",
   "supabase/functions/scriptory-api/deno.json",
   "supabase/functions/scriptory-api/index.ts",
   "supabase/functions/_shared/domain.ts"
@@ -19,6 +20,7 @@ for (const file of requiredFiles) {
 }
 
 const migration = await readFile(join(root, "supabase/migrations/20260701000000_scriptory_backend.sql"), "utf8");
+const accountMigration = await readFile(join(root, "supabase/migrations/20260702000000_accounts_profiles_notifications.sql"), "utf8");
 const indexSource = await readFile(join(root, "supabase/functions/scriptory-api/index.ts"), "utf8");
 const domainSource = await readFile(join(root, "supabase/functions/_shared/domain.ts"), "utf8");
 const envExample = await readFile(join(root, ".env.example"), "utf8");
@@ -36,11 +38,26 @@ for (const marker of [
 }
 
 for (const marker of [
+  "create table if not exists public.profiles",
+  "create table if not exists public.cv_documents",
+  "create table if not exists public.saved_jobs",
+  "create table if not exists public.notification_preferences",
+  "create table if not exists public.notifications",
+  "create trigger on_auth_user_created",
+  "auth.uid()",
+  "grant select, insert, update on public.profiles"
+]) {
+  assert.ok(accountMigration.includes(marker), `Supabase account migration missing marker: ${marker}`);
+}
+
+for (const marker of [
   "Deno.serve",
   "/v1/jobs",
   "/v1/ingest/run",
+  "/v1/notifications/run",
   "/v1/application-kits",
-  "SUPABASE_SERVICE_ROLE_KEY"
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "RESEND_API_KEY"
 ]) {
   assert.ok(indexSource.includes(marker) || config.includes(marker), `Supabase function missing marker: ${marker}`);
 }

@@ -11,6 +11,7 @@ const requiredFiles = [
   "supabase/migrations/20260701000000_scriptory_backend.sql",
   "supabase/migrations/20260702000000_accounts_profiles_notifications.sql",
   "supabase/migrations/20260703000000_admin_cms.sql",
+  "supabase/migrations/20260704000000_legal_compliance.sql",
   "supabase/functions/scriptory-api/deno.json",
   "supabase/functions/scriptory-api/index.ts",
   "supabase/functions/searchr-admin/deno.json",
@@ -25,6 +26,7 @@ for (const file of requiredFiles) {
 const migration = await readFile(join(root, "supabase/migrations/20260701000000_scriptory_backend.sql"), "utf8");
 const accountMigration = await readFile(join(root, "supabase/migrations/20260702000000_accounts_profiles_notifications.sql"), "utf8");
 const adminMigration = await readFile(join(root, "supabase/migrations/20260703000000_admin_cms.sql"), "utf8");
+const legalMigration = await readFile(join(root, "supabase/migrations/20260704000000_legal_compliance.sql"), "utf8");
 const indexSource = await readFile(join(root, "supabase/functions/scriptory-api/index.ts"), "utf8");
 const adminSource = await readFile(join(root, "supabase/functions/searchr-admin/index.ts"), "utf8");
 const domainSource = await readFile(join(root, "supabase/functions/_shared/domain.ts"), "utf8");
@@ -66,6 +68,16 @@ for (const marker of [
   "create or replace view public.admin_dashboard_summary_v"
 ]) {
   assert.ok(adminMigration.includes(marker), `Supabase admin migration missing marker: ${marker}`);
+}
+
+for (const marker of [
+  "create table if not exists public.legal_acceptances",
+  "create table if not exists public.privacy_requests",
+  "legal_acceptances_select_own",
+  "privacy_requests_insert_own",
+  "create or replace function public.handle_new_user"
+]) {
+  assert.ok(legalMigration.includes(marker), `Supabase legal migration missing marker: ${marker}`);
 }
 
 for (const marker of [

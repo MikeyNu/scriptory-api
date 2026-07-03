@@ -482,7 +482,7 @@ async function listUsers(params: URLSearchParams): Promise<AnyRecord> {
 }
 
 async function getUserDetail(userId: string): Promise<AnyRecord> {
-  const [profile, settings, preferences, cvDocuments, savedJobs, applications, notifications, accountEvents, notes] = await Promise.all([
+  const [profile, settings, preferences, cvDocuments, savedJobs, applications, notifications, accountEvents, notes, privacyRequests, legalAcceptances] = await Promise.all([
     getSingle("profiles", "id", userId),
     getSingle("user_settings", "user_id", userId),
     getSingle("notification_preferences", "user_id", userId),
@@ -491,7 +491,9 @@ async function getUserDetail(userId: string): Promise<AnyRecord> {
     listUserApplications(userId).then((result) => result.applications),
     listUserNotifications(userId).then((result) => result.notifications),
     listUserAccountEvents(userId),
-    listUserNotes(userId).then((result) => result.notes)
+    listUserNotes(userId).then((result) => result.notes),
+    listUserPrivacyRequests(userId),
+    listUserLegalAcceptances(userId)
   ]);
   return {
     profile,
@@ -503,12 +505,15 @@ async function getUserDetail(userId: string): Promise<AnyRecord> {
     notifications,
     accountEvents,
     notes,
+    privacyRequests,
+    legalAcceptances,
     stats: {
       cvDocuments: cvDocuments.length,
       savedJobs: savedJobs.length,
       applications: applications.length,
       notifications: notifications.length,
-      unreadNotifications: notifications.filter((item: AnyRecord) => !item.read_at).length
+      unreadNotifications: notifications.filter((item: AnyRecord) => !item.read_at).length,
+      openPrivacyRequests: privacyRequests.filter((item: AnyRecord) => !["completed", "rejected", "withdrawn"].includes(clean(item.status))).length
     }
   };
 }
@@ -612,6 +617,26 @@ async function listUserAccountEvents(userId: string): Promise<AnyRecord[]> {
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
     .limit(100);
+  if (error) throw error;
+  return data || [];
+}
+
+async function listUserPrivacyRequests(userId: string): Promise<AnyRecord[]> {
+  const { data, error } = await db
+    .from("privacy_requests")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+async function listUserLegalAcceptances(userId: string): Promise<AnyRecord[]> {
+  const { data, error } = await db
+    .from("legal_acceptances")
+    .select("*")
+    .eq("user_id", userId)
+    .order("accepted_at", { ascending: false });
   if (error) throw error;
   return data || [];
 }

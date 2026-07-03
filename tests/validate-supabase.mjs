@@ -10,8 +10,11 @@ const requiredFiles = [
   "supabase/.env.example",
   "supabase/migrations/20260701000000_scriptory_backend.sql",
   "supabase/migrations/20260702000000_accounts_profiles_notifications.sql",
+  "supabase/migrations/20260703000000_admin_cms.sql",
   "supabase/functions/scriptory-api/deno.json",
   "supabase/functions/scriptory-api/index.ts",
+  "supabase/functions/searchr-admin/deno.json",
+  "supabase/functions/searchr-admin/index.ts",
   "supabase/functions/_shared/domain.ts"
 ];
 
@@ -21,7 +24,9 @@ for (const file of requiredFiles) {
 
 const migration = await readFile(join(root, "supabase/migrations/20260701000000_scriptory_backend.sql"), "utf8");
 const accountMigration = await readFile(join(root, "supabase/migrations/20260702000000_accounts_profiles_notifications.sql"), "utf8");
+const adminMigration = await readFile(join(root, "supabase/migrations/20260703000000_admin_cms.sql"), "utf8");
 const indexSource = await readFile(join(root, "supabase/functions/scriptory-api/index.ts"), "utf8");
+const adminSource = await readFile(join(root, "supabase/functions/searchr-admin/index.ts"), "utf8");
 const domainSource = await readFile(join(root, "supabase/functions/_shared/domain.ts"), "utf8");
 const envExample = await readFile(join(root, ".env.example"), "utf8");
 const supabaseEnvExample = await readFile(join(root, "supabase/.env.example"), "utf8");
@@ -51,6 +56,19 @@ for (const marker of [
 }
 
 for (const marker of [
+  "create table if not exists public.admin_memberships",
+  "create table if not exists public.content_blocks",
+  "create table if not exists public.job_sources",
+  "create table if not exists public.job_moderation",
+  "create table if not exists public.template_catalog",
+  "create table if not exists public.palette_catalog",
+  "create or replace view public.public_jobs_v",
+  "create or replace view public.admin_dashboard_summary_v"
+]) {
+  assert.ok(adminMigration.includes(marker), `Supabase admin migration missing marker: ${marker}`);
+}
+
+for (const marker of [
   "Deno.serve",
   "/v1/jobs",
   "/v1/ingest/run",
@@ -60,6 +78,22 @@ for (const marker of [
   "RESEND_API_KEY"
 ]) {
   assert.ok(indexSource.includes(marker) || config.includes(marker), `Supabase function missing marker: ${marker}`);
+}
+
+for (const marker of [
+  "Deno.serve",
+  "/v1/admin/me",
+  "/v1/admin/dashboard",
+  "/v1/admin/users",
+  "/v1/admin/jobs",
+  "/v1/admin/sources",
+  "/v1/admin/content",
+  "/v1/admin/notification-campaigns",
+  "/v1/admin/admin-memberships",
+  "admin_audit_logs",
+  "admin_memberships"
+]) {
+  assert.ok(adminSource.includes(marker) || config.includes(marker), `Supabase admin function missing marker: ${marker}`);
 }
 
 for (const marker of [

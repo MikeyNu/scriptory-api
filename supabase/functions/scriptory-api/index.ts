@@ -27,8 +27,7 @@ Deno.serve(async (req) => {
   try {
     const url = new URL(req.url);
     const path = routePath(url.pathname);
-    const result = await route(req, path, url.searchParams, headers);
-    return result;
+    return await route(req, path, url.searchParams, headers);
   } catch (error) {
     const status = error.statusCode || 500;
     if (status === 500) console.error(error);
@@ -42,14 +41,34 @@ async function route(req: Request, path: string, params: URLSearchParams, header
   }
 
   if (path === "/v1/sources" && req.method === "GET") {
-    const settings = loadSourceConfig(Deno.env);
-    const sources = configuredSources(settings).map((source) => ({
+    const runtime = await loadRuntimeSourceConfig();
+    const sources = configuredSources(runtime.settings).map((source) => ({
       id: source.id,
       name: source.name,
       enabled: source.enabled
     }));
     const lastRun = await latestRun();
     return json({ sources, lastRun }, 200, headers);
+  }
+
+  if (path === "/v1/content" && req.method === "GET") {
+    const content = await loadPublishedContent(params);
+    return json({ content }, 200, headers);
+  }
+
+  if (path === "/v1/catalog/templates" && req.method === "GET") {
+    const templates = await loadTemplateCatalog();
+    return json({ templates }, 200, headers);
+  }
+
+  if (path === "/v1/catalog/palettes" && req.method === "GET") {
+    const palettes = await loadPaletteCatalog();
+    return json({ palettes }, 200, headers);
+  }
+
+  if (path === "/v1/feature-flags/public" && req.method === "GET") {
+    const flags = await loadPublicFeatureFlags();
+    return json({ flags }, 200, headers);
   }
 
   if (path === "/v1/ingest/run" && req.method === "POST") {
@@ -205,6 +224,151 @@ function requireAdmin(req: Request): void {
   }
 }
 
+async function loadPublishedContent(params: URLSearchParams): Promise<Record<string, AnyRecord>> {
+  const keys = String(params.get("keys") || "")
+    .split(",")
+    .map((item) => clean(item))
+    .filter(Boolean);
+  let query = db
+    .from("content_blocks")
+    .select("key,section,locale,content,status,published_at,updated_at")
+    .eq("status", "published")
+    .order("section", { ascending: true })
+    .order("key", { ascending: true });
+  if (keys.length) query = query.in("key", keys);
+  const { data, error } = await query;
+  if (error) throw error;
+  return Object.fromEntries((data || []).map((row: AnyRecord) => [row.key, row]));
+}
+
+async function loadTemplateCatalog(): Promise<AnyRecord[]> {
+  const { data, error } = await db
+    .from("template_catalog")
+    .select("*")
+    .eq("is_enabled", true)
+    .order("sort_order", { ascending: true })
+    .order("id", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function loadPaletteCatalog(): Promise<AnyRecord[]> {
+  const { data, error } = await db
+    .from("palette_catalog")
+    .select("*")
+    .eq("is_enabled", true)
+    .order("sort_order", { ascending: true })
+    .order("id", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function loadPublicFeatureFlags(): Promise<Record<string, boolean>> {
+  const { data, error } = await db
+    .from("feature_flags")
+    .select("key,enabled")
+    .in("key", ["public_content_blocks", "template_catalog", "job_moderation", "admin_cms"]);
+  if (error) throw error;
+  return Object.fromEntries((data || []).map((row: AnyRecord) => [row.key, Boolean(row.enabled)]));
+}
+
+async function loadRuntimeSourceConfig(): Promise<{ settings: AnyRecord; sourceIdByKey: Map<string, string> }> {
+  const base = loadSourceConfig(Deno.env);
+  const { data, error } = await db
+    .from("job_sources")
+    .select("*")
+    .eq("is_enabled", true)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  const rows = data || [];
+  if (!rows.length) {
+    return { settings: base, sourceIdByKey: new Map() };
+  }
+
+  const settings = {
+    adzuna: {
+      appId: base.adzuna.appId,
+      appKey: base.adzuna.appKey,
+      queries: [] as string[],
+      locations: [] as string[],
+      resultsPerQuery: base.adzuna.resultsPerQuery
+    },
+    greenhouseBoards: [] as string[],
+    leverCompanies: [] as string[],
+    partnerFeedUrls: [] as string[]
+  };
+  const sourceIdByKey = new Map<string, string>();
+
+  for (const row of rows) {
+    const config = row.config || {};
+    if (row.source_type === "adzuna_query_set") {
+      settings.adzuna.queries.push(...listFromJson(config.queries));
+      settings.adzuna.locations.push(...listFromJson(config.locations));
+      settings.adzuna.resultsPerQuery = int(config.resultsPerQuery, settings.adzuna.resultsPerQuery);
+      const generated = configuredSources({
+        adzuna: {
+          appId: settings.adzuna.appId,
+          appKey: settings.adzuna.appKey,
+          queries: settings.adzuna.queries.length ? settings.adzuna.queries : base.adzuna.queries,
+          locations: settings.adzuna.locations.length ? settings.adzuna.locations : base.adzuna.locations,
+          resultsPerQuery: settings.adzuna.resultsPerQuery
+        },
+        greenhouseBoards: [],
+        leverCompanies: [],
+        partnerFeedUrls: []
+      })[0];
+      if (generated?.id) sourceIdByKey.set(generated.id, row.id);
+      continue;
+    }
+    if (row.source_type === "greenhouse_board") {
+      const boardToken = clean(config.boardToken || config.board || config.url);
+      if (!boardToken) continue;
+      settings.greenhouseBoards.push(boardToken);
+      const generated = configuredSources({
+        adzuna: { appId: "", appKey: "", queries: [], locations: [], resultsPerQuery: 20 },
+        greenhouseBoards: [boardToken],
+        leverCompanies: [],
+        partnerFeedUrls: []
+      })[0];
+      if (generated?.id) sourceIdByKey.set(generated.id, row.id);
+      continue;
+    }
+    if (row.source_type === "lever_board") {
+      const companySlug = clean(config.companySlug || config.slug || config.url);
+      if (!companySlug) continue;
+      settings.leverCompanies.push(companySlug);
+      const generated = configuredSources({
+        adzuna: { appId: "", appKey: "", queries: [], locations: [], resultsPerQuery: 20 },
+        greenhouseBoards: [],
+        leverCompanies: [companySlug],
+        partnerFeedUrls: []
+      })[0];
+      if (generated?.id) sourceIdByKey.set(generated.id, row.id);
+      continue;
+    }
+    if (row.source_type === "partner_feed") {
+      const feedUrl = clean(config.feedUrl || config.url);
+      if (!feedUrl) continue;
+      settings.partnerFeedUrls.push(feedUrl);
+      const generated = configuredSources({
+        adzuna: { appId: "", appKey: "", queries: [], locations: [], resultsPerQuery: 20 },
+        greenhouseBoards: [],
+        leverCompanies: [],
+        partnerFeedUrls: [feedUrl]
+      })[0];
+      if (generated?.id) sourceIdByKey.set(generated.id, row.id);
+    }
+  }
+
+  settings.adzuna.queries = uniqueList(settings.adzuna.queries.length ? settings.adzuna.queries : base.adzuna.queries);
+  settings.adzuna.locations = uniqueList(settings.adzuna.locations.length ? settings.adzuna.locations : base.adzuna.locations);
+  settings.greenhouseBoards = uniqueList(settings.greenhouseBoards.length ? settings.greenhouseBoards : base.greenhouseBoards);
+  settings.leverCompanies = uniqueList(settings.leverCompanies.length ? settings.leverCompanies : base.leverCompanies);
+  settings.partnerFeedUrls = uniqueList(settings.partnerFeedUrls.length ? settings.partnerFeedUrls : base.partnerFeedUrls);
+
+  return { settings, sourceIdByKey };
+}
+
 async function queryJobs(params: URLSearchParams): Promise<AnyRecord> {
   const query = clean(params.get("query")).toLowerCase();
   const location = clean(params.get("location")).toLowerCase();
@@ -214,29 +378,40 @@ async function queryJobs(params: URLSearchParams): Promise<AnyRecord> {
   const offset = clamp(Number(params.get("offset") || 0), 0, 100000);
   const includeExpired = params.get("includeExpired") === "true";
 
-  let rowsQuery = applyJobFilters(
-    db.from("jobs").select("*", { count: "exact" }),
-    { query, location, source, workplace, includeExpired }
-  )
-    .order("posted_at", { ascending: false })
-    .range(offset, offset + limit - 1);
+  const rangeSize = Math.max(limit * 3, 60);
+  let start = offset;
+  const rows: AnyRecord[] = [];
+  let totalVisible = 0;
 
-  const { data, error, count } = await rowsQuery;
-  if (error) throw error;
+  while (rows.length < limit) {
+    const end = start + rangeSize - 1;
+    const baseQuery = applyJobFilters(
+      db.from("public_jobs_v").select("*", { count: "exact" }),
+      { query, location, source, workplace, includeExpired }
+    )
+      .order("pinned_rank", { ascending: true, nullsFirst: false })
+      .order("posted_at", { ascending: false })
+      .range(start, end);
+    const { data, error, count } = await baseQuery;
+    if (error) throw error;
+    if (!rows.length) totalVisible = count || 0;
+    rows.push(...(data || []));
+    if (!data?.length || rows.length >= limit || end >= totalVisible) break;
+    start = end + 1;
+  }
 
   const sourceQuery = applyJobFilters(
-    db.from("jobs").select("source"),
+    db.from("public_jobs_v").select("source"),
     { query, location, source, workplace, includeExpired }
   ).range(0, 9999);
-
   const { data: sourceRows, error: sourceError } = await sourceQuery;
   if (sourceError) throw sourceError;
 
   return {
-    total: count || 0,
+    total: totalVisible,
     limit,
     offset,
-    jobs: (data || []).map(mapJobRow),
+    jobs: rows.slice(0, limit).map(mapJobRow),
     sources: summarizeSources((sourceRows || []).map((row: AnyRecord) => row.source))
   };
 }
@@ -263,16 +438,17 @@ function summarizeSources(sources: string[]): AnyRecord[] {
 
 async function findJob(id: string): Promise<AnyRecord | null> {
   if (!id) return null;
-  const { data, error } = await db.from("jobs").select("*").eq("id", id).maybeSingle();
+  const { data, error } = await db.from("public_jobs_v").select("*").eq("id", id).maybeSingle();
   if (error) throw error;
   return data ? mapJobRow(data) : null;
 }
 
 async function loadActiveJobs(limit: number): Promise<AnyRecord[]> {
   const { data, error } = await db
-    .from("jobs")
+    .from("public_jobs_v")
     .select("*")
     .neq("status", "expired")
+    .order("pinned_rank", { ascending: true, nullsFirst: false })
     .order("posted_at", { ascending: false })
     .limit(clamp(limit, 1, 500));
   if (error) throw error;
@@ -280,7 +456,7 @@ async function loadActiveJobs(limit: number): Promise<AnyRecord[]> {
 }
 
 async function countJobs(): Promise<number> {
-  const { count, error } = await db.from("jobs").select("id", { count: "exact", head: true }).neq("status", "expired");
+  const { count, error } = await db.from("public_jobs_v").select("id", { count: "exact", head: true }).neq("status", "expired");
   if (error) throw error;
   return count || 0;
 }
@@ -297,8 +473,8 @@ async function latestRun(): Promise<AnyRecord | null> {
 }
 
 async function runIngestion(reason: string): Promise<AnyRecord> {
-  const settings = loadSourceConfig(Deno.env);
-  const sources = configuredSources(settings);
+  const runtime = await loadRuntimeSourceConfig();
+  const sources = configuredSources(runtime.settings);
   const startedAt = new Date().toISOString();
   const reports: AnyRecord[] = [];
   let fetchedCount = 0;
@@ -313,9 +489,12 @@ async function runIngestion(reason: string): Promise<AnyRecord> {
       fetched: 0,
       upserted: 0,
       failed: 0,
-      error: ""
+      error: "",
+      startedAt: new Date().toISOString(),
+      finishedAt: ""
     };
     if (!source.enabled) {
+      report.finishedAt = new Date().toISOString();
       reports.push(report);
       continue;
     }
@@ -326,11 +505,16 @@ async function runIngestion(reason: string): Promise<AnyRecord> {
       fetchedCount += rawJobs.length;
       report.upserted = await upsertJobs(jobs);
       upsertedCount += report.upserted;
+      const sourceRowId = runtime.sourceIdByKey.get(source.id);
+      if (sourceRowId) {
+        await db.from("job_sources").update({ last_success_at: new Date().toISOString() }).eq("id", sourceRowId);
+      }
     } catch (error) {
       report.error = formatError(error);
       report.failed += 1;
       failedCount += 1;
     }
+    report.finishedAt = new Date().toISOString();
     reports.push(report);
   }
 
@@ -357,6 +541,24 @@ async function runIngestion(reason: string): Promise<AnyRecord> {
     sources: run.sources
   });
   if (error) throw error;
+
+  const sourceRunRows = reports
+    .filter((report) => runtime.sourceIdByKey.has(report.id))
+    .map((report) => ({
+      ingestion_run_id: run.id,
+      job_source_id: runtime.sourceIdByKey.get(report.id),
+      source_key: report.id,
+      fetched_count: report.fetched,
+      upserted_count: report.upserted,
+      failed_count: report.failed,
+      error_text: report.error,
+      started_at: report.startedAt,
+      finished_at: report.finishedAt
+    }));
+  if (sourceRunRows.length) {
+    const { error: reportError } = await db.from("source_run_reports").insert(sourceRunRows);
+    if (reportError) throw reportError;
+  }
 
   return { run, totalJobs: await countJobs() };
 }
@@ -444,7 +646,7 @@ async function runNotificationWorker(input: AnyRecord = {}): Promise<AnyRecord> 
 
   const [{ data: preferences, error: preferencesError }, { data: profiles, error: profilesError }, { data: settings, error: settingsError }, { data: cvs, error: cvsError }, { data: applications, error: applicationsError }] = await Promise.all([
     db.from("notification_preferences").select("*").or("in_app_enabled.eq.true,email_job_alerts.eq.true"),
-    db.from("profiles").select("*"),
+    db.from("profiles").select("*").eq("account_status", "active"),
     db.from("user_settings").select("*"),
     db.from("cv_documents").select("*").eq("is_primary", true),
     db.from("applications").select("user_id,job_id,status")
@@ -464,6 +666,7 @@ async function runNotificationWorker(input: AnyRecord = {}): Promise<AnyRecord> 
 
   for (const preference of preferences || []) {
     const userId = preference.user_id;
+    if (!profileMap.has(userId)) continue;
     const cv = cvMap.get(userId);
     if (!cv?.cv_state) continue;
     const threshold = clamp(Number(settingsMap.get(userId)?.minimum_match_score || 70), 0, 100);
@@ -504,7 +707,7 @@ async function runNotificationWorker(input: AnyRecord = {}): Promise<AnyRecord> 
 
 async function loadRecentJobs(since: string, limit: number): Promise<AnyRecord[]> {
   const { data, error } = await db
-    .from("jobs")
+    .from("public_jobs_v")
     .select("*")
     .neq("status", "expired")
     .gte("first_seen_at", since)
@@ -641,6 +844,21 @@ function mapApplicationRow(row: AnyRecord): AnyRecord {
     externalApplicationId: row.external_application_id,
     events: row.events || []
   };
+}
+
+function listFromJson(value: unknown): string[] {
+  if (Array.isArray(value)) return uniqueList(value.map((item) => clean(item)).filter(Boolean));
+  return uniqueList(String(value || "").split(",").map((item) => clean(item)).filter(Boolean));
+}
+
+function uniqueList(items: string[]): string[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = item.toLowerCase();
+    if (!item || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function chunks<T>(items: T[], size: number): T[][] {

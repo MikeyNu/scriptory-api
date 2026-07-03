@@ -2,3 +2,6 @@ project_id = "fdtncidguldauilzlxgs"
 
 [functions.scriptory-api]
 verify_jwt = false
+
+[functions.searchr-admin]
+verify_jwt = false

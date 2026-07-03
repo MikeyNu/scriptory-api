@@ -12,7 +12,9 @@
     "supabase:setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-supabase.ps1",
     "supabase:link": "supabase link --project-ref fdtncidguldauilzlxgs",
     "supabase:serve": "supabase functions serve scriptory-api --env-file supabase/.env",
+    "supabase:serve:admin": "supabase functions serve searchr-admin --env-file supabase/.env",
     "supabase:deploy": "supabase functions deploy scriptory-api --project-ref fdtncidguldauilzlxgs --no-verify-jwt --use-api",
+    "supabase:deploy:admin": "supabase functions deploy searchr-admin --project-ref fdtncidguldauilzlxgs --no-verify-jwt --use-api",
     "supabase:secrets:push": "supabase secrets set --env-file supabase/.env --project-ref fdtncidguldauilzlxgs",
     "supabase:db:push": "supabase db push"
   },
